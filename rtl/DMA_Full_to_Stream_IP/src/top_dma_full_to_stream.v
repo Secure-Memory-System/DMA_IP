@@ -24,7 +24,7 @@ module top_dma_full_to_stream #(
     parameter integer C_S_AXI_ADDR_WIDTH    = 5,
     parameter integer C_M_AXI_ADDR_WIDTH    = 32,
     parameter integer C_M_AXI_DATA_WIDTH    = 32,
-    parameter integer C_M_AXIS_DATA_WIDTH   = 32
+    parameter integer C_M_AXIS_DATA_WIDTH   = 128
 )(
     input  wire aclk,
     input  wire aresetn,
@@ -88,30 +88,54 @@ module top_dma_full_to_stream #(
     reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg2; // 0x08 SRC_ADDR
     reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg3; // 0x0C TRF_LEN
 
-    // Write 핸드셰이크
-    reg awready_reg, wready_reg, bvalid_reg;
-    assign s_axi_awready = awready_reg;
-    assign s_axi_wready  = wready_reg;
+    // Write 핸드셰이크 (AW/W 채널 래치 방식)
+    // AXI Interconnect가 AW/W를 다른 클럭에 보낼 수 있으므로 각각 래치
+    reg        aw_done, w_done;
+    reg [4:0]  aw_addr_hold;
+    reg [31:0] w_data_hold;
+    reg        bvalid_reg;
+
+    assign s_axi_awready = ~aw_done;
+    assign s_axi_wready  = ~w_done;
     assign s_axi_bvalid  = bvalid_reg;
     assign s_axi_bresp   = 2'b00;
 
+    wire wr_fire = aw_done && w_done;
+
     always @(posedge aclk) begin
         if (!aresetn) begin
-            awready_reg <= 0;
-            wready_reg  <= 0;
-            bvalid_reg  <= 0;
-        end else begin
-            awready_reg <= (s_axi_awvalid && !awready_reg) ? 1'b1 : 1'b0;
-            wready_reg  <= (s_axi_wvalid  && !wready_reg)  ? 1'b1 : 1'b0;
-            if (awready_reg && wready_reg)
-                bvalid_reg <= 1;
-            else if (s_axi_bready && bvalid_reg)
-                bvalid_reg <= 0;
+            aw_done      <= 0;
+            aw_addr_hold <= 0;
+        end else if (s_axi_awvalid && !aw_done) begin
+            aw_done      <= 1;
+            aw_addr_hold <= s_axi_awaddr;
+        end else if (wr_fire) begin
+            aw_done      <= 0;
         end
     end
 
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            w_done      <= 0;
+            w_data_hold <= 0;
+        end else if (s_axi_wvalid && !w_done) begin
+            w_done      <= 1;
+            w_data_hold <= s_axi_wdata;
+        end else if (wr_fire) begin
+            w_done      <= 0;
+        end
+    end
+
+    always @(posedge aclk) begin
+        if (!aresetn)
+            bvalid_reg <= 0;
+        else if (wr_fire && !bvalid_reg)
+            bvalid_reg <= 1;
+        else if (s_axi_bready && bvalid_reg)
+            bvalid_reg <= 0;
+    end
+
     // 레지스터 쓰기
-    wire [2:0] wr_addr = s_axi_awaddr[4:2];
     always @(posedge aclk) begin
         if (!aresetn) begin
             slv_reg0 <= 0;
@@ -121,24 +145,27 @@ module top_dma_full_to_stream #(
             // start 비트 자동 clear
             if (slv_reg0[0]) slv_reg0[0] <= 1'b0;
 
-            if (awready_reg && wready_reg) begin
-                case (wr_addr)
-                    3'h0: slv_reg0 <= s_axi_wdata;
-                    3'h2: slv_reg2 <= s_axi_wdata;
-                    3'h3: slv_reg3 <= s_axi_wdata;
+            if (wr_fire) begin
+                case (aw_addr_hold[4:2])
+                    3'h0: slv_reg0 <= w_data_hold;
+                    3'h2: slv_reg2 <= w_data_hold;
+                    3'h3: slv_reg3 <= w_data_hold;
                     // 0x04 STAT은 read-only, 쓰기 무시
                 endcase
             end
         end
     end
 
-    // done 신호를 STAT 레지스터에 반영
+    // done 신호를 STAT 레지스터에 래치 (polling으로 확인 가능하도록)
+    // start 시 클리어, done 펄스 시 set, CPU가 읽을 때까지 유지
     wire dma_done;
     always @(posedge aclk) begin
         if (!aresetn)
             slv_reg1 <= 0;
-        else
-            slv_reg1[0] <= dma_done;
+        else if (wr_fire && aw_addr_hold[4:2] == 3'h0)
+            slv_reg1[0] <= 0;      // CTRL 쓰기(start) 시 done 클리어
+        else if (dma_done)
+            slv_reg1[0] <= 1;      // done 래치 (유지)
     end
 
     // Read 핸드셰이크
